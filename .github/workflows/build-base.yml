@@ -1,0 +1,164 @@
+name: Build Balatro iOS base (LÖVE 12 / SDL3, iOS 27.1 SDK)
+
+# Builds LÖVE for iOS with the newest Xcode on the runner, then repackages it in
+# the layout balatro-mobile-maker expects (Payload/Balatro.app/Balatro) and
+# publishes it as balatro-base.ipa.
+
+on:
+  workflow_dispatch:
+    inputs:
+      love_ref:
+        description: LÖVE branch, tag or commit to build
+        default: main
+      allow_older_sdk:
+        description: Build even if the 27.1 SDK is missing (no full-screen Duo layout)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  WANT_SDK: "27.1"
+  OLD_BASE_URL: https://github.com/blake502/balatro-apk-maker/releases/download/Additional-Tools-1.0/balatro-base.ipa
+
+jobs:
+  build:
+    # Image with the Xcode 27 toolchain. If this label is rejected, check
+    # https://github.com/actions/runner-images for the current Xcode 27 label.
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - name: Checkout LÖVE
+        uses: actions/checkout@v4
+        with:
+          repository: love2d/love
+          ref: ${{ inputs.love_ref }}
+          path: love
+
+      - name: Checkout LÖVE Apple dependencies
+        uses: actions/checkout@v4
+        with:
+          repository: love2d/love-apple-dependencies
+          ref: main
+          path: apple-dependencies
+
+      - name: Move dependencies into place
+        run: |
+          mv apple-dependencies/iOS/libraries love/platform/xcode/ios
+          mv apple-dependencies/shared love/platform/xcode
+
+      - name: Select Xcode with the iOS SDK we want
+        run: |
+          set -e
+          : > sdks.txt
+          for app in /Applications/Xcode*.app; do
+            dir="$app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs"
+            [ -d "$dir" ] || continue
+            echo "$app: $(ls "$dir" | tr '\n' ' ')"
+            for sdk in "$dir"/iPhoneOS[0-9]*.sdk; do
+              v=$(basename "$sdk" .sdk); v=${v#iPhoneOS}
+              echo "$v $app" >> sdks.txt
+            done
+          done
+          best=$(sort -V sdks.txt | tail -1)
+          best_v=${best%% *}; best_app=${best#* }
+          echo "Best installed iOS SDK: $best_v ($best_app)"
+          if [ "$(printf '%s\n' "$WANT_SDK" "$best_v" | sort -V | head -1)" != "$WANT_SDK" ]; then
+            echo "::warning::iOS $WANT_SDK SDK not installed on this runner (best is $best_v)."
+            if [ "${{ inputs.allow_older_sdk }}" != "true" ]; then
+              echo "Failing. Re-run with allow_older_sdk=true to build anyway."
+              exit 1
+            fi
+          fi
+          sudo xcode-select -s "$best_app/Contents/Developer"
+          xcodebuild -version
+
+      - name: Build LÖVE for iOS (unsigned)
+        working-directory: love
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project platform/xcode/love.xcodeproj \
+            -scheme love-ios \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Download the original Balatro base (for icons and identity)
+        run: |
+          curl -fsSL -o old-base.ipa "$OLD_BASE_URL"
+          mkdir old && unzip -q old-base.ipa -d old
+
+      - name: Assemble balatro-base.ipa
+        run: |
+          set -e
+          SRC="build/Build/Products/Release-iphoneos/love.app"
+          APP="ipa/Payload/Balatro.app"
+          OLD="old/Payload/Balatro.app"
+          mkdir -p ipa/Payload
+          cp -R "$SRC" "$APP"
+
+          EXE=$(plutil -extract CFBundleExecutable raw "$APP/Info.plist")
+          mv "$APP/$EXE" "$APP/Balatro"
+
+          # Balatro icons
+          cp "$OLD/Assets.car" "$APP/Assets.car"
+          cp "$OLD"/iOS\ AppIcon*.png "$APP/"
+
+          # Keep the Xcode-generated plist (correct SDK keys), overlay Balatro's identity
+          APP="$APP" OLD="$OLD" python3 - <<'PY'
+          import os, plistlib
+          app, old = os.environ["APP"], os.environ["OLD"]
+          new_p = plistlib.load(open(app + "/Info.plist", "rb"))
+          old_p = plistlib.load(open(old + "/Info.plist", "rb"))
+          for k in ["CFBundleIdentifier", "CFBundleName", "CFBundleDisplayName",
+                    "CFBundleIcons", "CFBundleIcons~ipad",
+                    "UISupportedInterfaceOrientations", "UIFileSharingEnabled"]:
+              if k in old_p:
+                  new_p[k] = old_p[k]
+          new_p["CFBundleExecutable"] = "Balatro"
+          new_p.pop("UISupportedInterfaceOrientations~ipad", None)
+          plistlib.dump(new_p, open(app + "/Info.plist", "wb"))
+          PY
+
+          rm -rf "$APP/_CodeSignature"
+          (cd ipa && zip -qry ../balatro-base.ipa Payload)
+          ls -lh balatro-base.ipa
+
+      - name: Report SDK stamp
+        run: |
+          vtool -show-build "ipa/Payload/Balatro.app/Balatro" | tee sdk.txt
+          {
+            echo "### Binary build stamp"
+            echo '```'
+            cat sdk.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: balatro-base-ipa
+          path: balatro-base.ipa
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Publish as a release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "base-run-${{ github.run_number }}" balatro-base.ipa \
+            --repo "${{ github.repository }}" \
+            --title "Balatro iOS base (run ${{ github.run_number }})" \
+            --notes "LÖVE ref: ${{ inputs.love_ref }}. See the run summary for the SDK stamp." \
+            --prerelease
