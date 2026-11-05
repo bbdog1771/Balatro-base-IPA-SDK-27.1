@@ -118,7 +118,8 @@ jobs:
           old_p = plistlib.load(open(old + "/Info.plist", "rb"))
           for k in ["CFBundleIdentifier", "CFBundleName", "CFBundleDisplayName",
                     "CFBundleIcons", "CFBundleIcons~ipad",
-                    "UISupportedInterfaceOrientations", "UIFileSharingEnabled"]:
+                    "UISupportedInterfaceOrientations", "UIFileSharingEnabled",
+                    "LSSupportsOpeningDocumentsInPlace"]:
               if k in old_p:
                   new_p[k] = old_p[k]
           new_p["CFBundleExecutable"] = "Balatro"
