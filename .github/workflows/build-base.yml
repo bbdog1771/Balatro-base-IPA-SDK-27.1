@@ -48,6 +48,27 @@ jobs:
           mv apple-dependencies/iOS/libraries love/platform/xcode/ios
           mv apple-dependencies/shared love/platform/xcode
 
+      - name: Patch LÖVE to save in Documents on iOS (matches the old base)
+        run: |
+          python3 - <<'PY'
+          p = "love/src/modules/filesystem/physfs/Filesystem.cpp"
+          s = open(p, encoding="utf-8").read()
+          old = ("\tcase COMMONPATH_USER_APPDATA:\n"
+                 "\t\tfullPaths[path] = apple::getUserDirectory(apple::USER_DIRECTORY_APPSUPPORT);\n"
+                 "\t\tbreak;\n")
+          new = ("\tcase COMMONPATH_USER_APPDATA:\n"
+                 "#ifdef LOVE_IOS\n"
+                 "\t\t// Save into Documents (visible in the Files app), like the original Balatro base.\n"
+                 "\t\tfullPaths[path] = apple::getUserDirectory(apple::USER_DIRECTORY_DOCUMENTS);\n"
+                 "#else\n"
+                 "\t\tfullPaths[path] = apple::getUserDirectory(apple::USER_DIRECTORY_APPSUPPORT);\n"
+                 "#endif\n"
+                 "\t\tbreak;\n")
+          assert s.count(old) == 1, "save-path code not found; LÖVE changed"
+          open(p, "w", encoding="utf-8").write(s.replace(old, new))
+          print("patched iOS save directory -> Documents")
+          PY
+
       - name: Select Xcode with the iOS SDK we want
         run: |
           set -e
